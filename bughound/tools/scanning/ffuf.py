@@ -146,6 +146,97 @@ async def execute(
     return result
 
 
+async def discover_params(
+    target_url: str,
+    *,
+    wordlist: str | None = None,
+    method: str = "GET",
+    timeout: int = 90,
+    threads: int = 40,
+) -> ToolResult:
+    """Discover hidden query/body parameter names against a single endpoint.
+
+    Sends ``?FUZZ=bughound`` (GET) or body ``FUZZ=bughound`` (POST) and uses
+    ffuf's auto-calibration so we filter out the constant baseline. A "hit"
+    means the param name changed the response — i.e. the server actually
+    consumed it.
+
+    target_url: the endpoint to probe (without FUZZ).
+    method: "GET" or "POST".
+    """
+    wl = wordlist or find_wordlist("params")
+    if not wl:
+        return ToolResult(
+            tool=BINARY, target=target_url, success=False,
+            error=tool_runner.ToolError(
+                error_type=tool_runner.ToolErrorType.EXECUTION,
+                message="No params wordlist found. Install seclists or assetnote params.",
+            ),
+        )
+
+    method = method.upper()
+    if method == "POST":
+        url = target_url
+        ffuf_args_method_specific = [
+            "-X", "POST",
+            "-d", "FUZZ=bughound",
+            "-H", "Content-Type: application/x-www-form-urlencoded",
+        ]
+    else:
+        sep = "&" if "?" in target_url else "?"
+        url = f"{target_url}{sep}FUZZ=bughound"
+        ffuf_args_method_specific = []
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, prefix="bughound_ffuf_param_",
+    )
+    tmp.close()
+    output_file = Path(tmp.name)
+
+    args = [
+        "-u", url,
+        "-w", wl,
+        "-o", str(output_file),
+        "-of", "json",
+        "-mc", "all",        # auto-calibration filters baseline noise
+        "-fc", "404,400",    # drop hard-fail responses outright
+        "-ac",               # auto-calibrate filters from baseline FUZZ values
+        "-t", str(threads),
+        "-timeout", "10",
+        "-noninteractive",
+        "-s",
+        *ffuf_args_method_specific,
+    ]
+
+    try:
+        result = await tool_runner.run(
+            BINARY, args, target=target_url, timeout=timeout,
+        )
+    finally:
+        findings = _parse_output_file(output_file)
+        if output_file.exists():
+            output_file.unlink(missing_ok=True)
+
+    # Convert ffuf path-style output into param-style hits.
+    param_hits: list[dict[str, Any]] = []
+    for item in findings:
+        param_name = item.get("path", "/").lstrip("/")
+        if not param_name:
+            continue
+        param_hits.append({
+            "url": target_url,
+            "param": param_name,
+            "method": method,
+            "status_code": item.get("status_code", 0),
+            "content_length": item.get("content_length", 0),
+        })
+
+    result.success = True
+    result.results = param_hits
+    result.result_count = len(param_hits)
+    return result
+
+
 def _parse_output_file(output_file: Path) -> list[dict[str, Any]]:
     """Parse ffuf JSON output."""
     if not output_file.exists():

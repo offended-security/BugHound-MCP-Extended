@@ -13,12 +13,40 @@ import asyncio
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
 import aiohttp
 import structlog
+import tldextract
 
 logger = structlog.get_logger()
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+
+def _etld_plus_one(value: str) -> str:
+    """Registrable domain (eTLD+1) for a host or URL. Returns "" on failure."""
+    if not value:
+        return ""
+    s = value.strip().lower()
+    if "://" in s:
+        try:
+            host = urlparse(s).hostname or ""
+        except Exception:
+            host = ""
+    else:
+        host = s.split("/", 1)[0].split(":", 1)[0]
+    if not host:
+        return ""
+    ext = tldextract.extract(host)
+    if not ext.domain or not ext.suffix:
+        return ""
+    return f"{ext.domain}.{ext.suffix}".lower()
+
+
+def _url_matches_target(url: str, target: str) -> bool:
+    """True iff URL hostname's eTLD+1 equals the target's eTLD+1."""
+    return bool(_etld_plus_one(url)) and _etld_plus_one(url) == _etld_plus_one(target)
 
 
 # Cache of API keys loaded from ~/.gau.toml
@@ -221,7 +249,7 @@ async def alienvault_otx_endpoints(domain: str) -> list[str]:
                 urls = []
                 for entry in data.get("url_list", []):
                     url = entry.get("url", "")
-                    if url:
+                    if url and _url_matches_target(url, domain):
                         urls.append(url)
                 return urls
     except Exception as e:
@@ -249,7 +277,7 @@ async def urlscan_endpoints(domain: str) -> list[str]:
                 for result in data.get("results", []):
                     page = result.get("page", {})
                     url = page.get("url", "")
-                    if url and domain in url:
+                    if url and _url_matches_target(url, domain):
                         urls.add(url)
                 return list(urls)
     except Exception as e:
@@ -276,7 +304,7 @@ async def commoncrawl_endpoints(domain: str) -> list[str]:
                     try:
                         entry = json.loads(line)
                         url = entry.get("url", "")
-                        if url:
+                        if url and _url_matches_target(url, domain):
                             urls.add(url)
                     except Exception:
                         continue

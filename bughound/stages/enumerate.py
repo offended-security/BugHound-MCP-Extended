@@ -14,6 +14,7 @@ import structlog
 
 from bughound.core import workspace
 from bughound.core.job_manager import JobManager
+from bughound.core.scope import ScopeFilter, hostname_matches_target
 from bughound.schemas.models import TargetType, ToolResult, WorkspaceState
 from bughound.tools.recon import (
     amass, assetfinder, crtsh, dns_resolver, findomain, gotator, puredns, subfinder,
@@ -113,6 +114,29 @@ async def enumerate_light(workspace_id: str) -> dict[str, Any]:
                 tool_timing[source_name] = f"{len(subs)} found"
     except Exception as exc:
         warnings.append(f"Passive API sources: {exc}")
+
+    # eTLD+1 filter: drop lookalike domains that passive sources sometimes
+    # return (e.g. crt.sh SAN entries, urlscan substring matches). We only
+    # keep subdomains whose registrable domain matches the target's.
+    pre_etld = len(all_subs)
+    all_subs = {s for s in all_subs if hostname_matches_target(s, target)}
+    etld_dropped = pre_etld - len(all_subs)
+    if etld_dropped:
+        warnings.append(
+            f"scope: dropped {etld_dropped} subdomain(s) outside target eTLD+1",
+        )
+        sources = {k: v for k, v in sources.items() if k in all_subs}
+
+    # Workspace scope filter: respect any user-defined include/exclude on top
+    scope_filter = await ScopeFilter.load(workspace_id)
+    pre_scope = len(all_subs)
+    all_subs = {s for s in all_subs if scope_filter.allow(s)}
+    scope_dropped = pre_scope - len(all_subs)
+    if scope_dropped:
+        warnings.append(
+            f"scope: dropped {scope_dropped} subdomain(s) per workspace scope rules",
+        )
+        sources = {k: v for k, v in sources.items() if k in all_subs}
 
     deduped = sorted(all_subs)
 

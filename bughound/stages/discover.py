@@ -17,6 +17,7 @@ import structlog
 
 from bughound.core import workspace
 from bughound.core.job_manager import JobManager
+from bughound.core.scope import ScopeFilter
 from bughound.schemas.models import TargetType, WorkspaceState
 from bughound.tools.discovery import (
     auth_analyzer, cors_checker, dir_scanner, form_extractor, js_analyzer,
@@ -144,6 +145,24 @@ async def _run_discover(
     warnings: list[str] = []
     files_written: list[str] = []
 
+    # Load scope filter once for the whole stage. Every active probe must
+    # consult this before sending a packet so we never touch out-of-scope.
+    scope_filter = await ScopeFilter.load(workspace_id)
+
+    # Pre-probe scope check on resolved targets
+    targets, dropped_targets = scope_filter.filter_url_strings(targets)
+    if dropped_targets:
+        warnings.append(
+            f"scope: dropped {dropped_targets} out-of-scope target(s) before probing",
+        )
+    if not targets:
+        await workspace.add_stage_history(workspace_id, 2, "completed")
+        return _error(
+            "invalid_input",
+            "All resolved targets are out of scope. Update workspace scope "
+            "include/exclude patterns and retry.",
+        )
+
     # ===================================================================
     # Phase 2A: Probe + Fingerprint
     # ===================================================================
@@ -163,6 +182,20 @@ async def _run_discover(
         warnings.append(f"httpx: {httpx_result.error.message if httpx_result.error else 'failed'}")
 
     live_hosts: list[dict[str, Any]] = httpx_result.results if httpx_result.success else []
+
+    # Post-probe scope check: httpx may have followed redirects to other
+    # domains. Drop any that landed out of scope before we touch them again.
+    if live_hosts:
+        pre_scope = len(live_hosts)
+        live_hosts = [
+            h for h in live_hosts
+            if scope_filter.allow(h.get("url") or h.get("host") or "")
+        ]
+        dropped = pre_scope - len(live_hosts)
+        if dropped:
+            warnings.append(
+                f"scope: dropped {dropped} live host(s) that redirected out of scope",
+            )
 
     if not live_hosts:
         await workspace.add_stage_history(workspace_id, 2, "completed")
@@ -382,13 +415,21 @@ async def _run_discover(
         target_domain = meta.target.replace("http://", "").replace("https://", "").strip("/")
         ep_results = await gather_endpoints(target_domain)
         passive_url_count = 0
+        passive_dropped = 0
         for source_name, urls in ep_results.items():
             for url_str in urls:
                 if url_str and url_str.startswith("http"):
+                    if not scope_filter.allow(url_str):
+                        passive_dropped += 1
+                        continue
                     all_urls.append({"url": url_str, "source": source_name})
                     passive_url_count += 1
         if passive_url_count > 0:
             logger.info("discover.passive_endpoints", count=passive_url_count, sources=list(ep_results.keys()))
+        if passive_dropped > 0:
+            warnings.append(
+                f"scope: dropped {passive_dropped} out-of-scope URL(s) from passive sources",
+            )
     except Exception as exc:
         warnings.append(f"Passive endpoint sources: {exc}")
 
@@ -730,15 +771,19 @@ async def _run_discover(
             pass
         return False
 
-    # Deduplicate + clean + filter static assets
+    # Deduplicate + clean + filter static assets + enforce scope.
     seen_urls: set[str] = set()
     unique_urls: list[dict[str, str]] = []
     static_filtered = 0
+    scope_filtered = 0
     for entry in all_urls:
         u = _clean_url(entry.get("url", ""))
         if not u or u in seen_urls:
             continue
         seen_urls.add(u)
+        if not scope_filter.allow(u):
+            scope_filtered += 1
+            continue
         if _is_static_asset(u):
             static_filtered += 1
             continue
@@ -751,6 +796,10 @@ async def _run_discover(
             "discover.static_filtered",
             dropped=static_filtered,
             remaining=len(unique_urls),
+        )
+    if scope_filtered > 0:
+        warnings.append(
+            f"scope: dropped {scope_filtered} out-of-scope URL(s) during dedup",
         )
 
     # ===================================================================
@@ -1370,6 +1419,45 @@ async def _run_discover(
         except Exception as exc:
             warnings.append(f"SPA backend probe: {exc}")
 
+        # Playwright fallback: when JS route extraction yielded few routes
+        # (< 5), the SPA may use dynamic/lazy routes that only appear after
+        # render. Headless Chromium captures real XHR/fetch traffic.
+        if len(spa_routes) < 5:
+            try:
+                _playwright_capture: list[dict[str, Any]] = []
+                for _spa_host in spa_detections[:3]:  # cap at 3 hosts
+                    _cap = await spa_analyzer.render_and_capture(
+                        _spa_host["host"], wait_seconds=5, max_routes=8,
+                    )
+                    if _cap.get("status") == "success":
+                        for _api_call in _cap.get("captured_api_calls", []):
+                            _api_url = _api_call.get("url", "")
+                            if _api_url and scope_filter.allow(_api_url):
+                                _playwright_capture.append({
+                                    "host": _spa_host["host"],
+                                    "method": _api_call.get("method", "GET"),
+                                    "url": _api_url,
+                                    "resource_type": _api_call.get("resource_type", ""),
+                                })
+                                all_urls.append({
+                                    "url": _api_url,
+                                    "source": "playwright_render",
+                                })
+                if _playwright_capture:
+                    await workspace.write_data(
+                        workspace_id, "urls/playwright_capture.json",
+                        _playwright_capture,
+                        generated_by="spa_analyzer.render_and_capture",
+                        target=target_label,
+                    )
+                    files_written.append("urls/playwright_capture.json")
+                    logger.info(
+                        "discover.playwright_capture",
+                        captured=len(_playwright_capture),
+                    )
+            except Exception as exc:
+                warnings.append(f"Playwright SPA render: {exc}")
+
         # Add discovered SPA routes and backend paths to all_urls so later
         # phases (param extraction, nuclei, etc.) see them.
         for spa_host in spa_detections:
@@ -1524,11 +1612,18 @@ async def _run_discover(
         if progress_cb:
             await progress_cb(65, "Checking subdomain takeover", "takeover")  # 2D
 
-        # Dead subs = in subdomains/all.txt but not in live hosts
+        # Dead subs = in subdomains/all.txt but not in live hosts.
+        # Filter to in-scope only — Stage 1 may have collected lookalikes
+        # from passive sources (crtsh/urlscan) that we must not probe.
         live_hosts_set = {h.get("host", "").lower() for h in live_hosts}
         all_subs_data = await workspace.read_data(workspace_id, "subdomains/all.txt")
         all_subs = all_subs_data if isinstance(all_subs_data, list) else []
-        dead_subs = [s for s in all_subs if s.lower() not in live_hosts_set]
+        dead_subs_raw = [s for s in all_subs if s.lower() not in live_hosts_set]
+        dead_subs, dropped_dead = scope_filter.filter_url_strings(dead_subs_raw)
+        if dropped_dead:
+            warnings.append(
+                f"scope: dropped {dropped_dead} out-of-scope dead subdomain(s) before takeover check",
+            )
 
         # Load DNS records for CNAME lookup
         dns_data = await workspace.read_data(workspace_id, "dns/records.json")
@@ -1699,40 +1794,162 @@ async def _run_discover(
             warnings.append(f"ffuf dir fuzzing: {exc}")
 
     # ===================================================================
-    # Phase 2F-param: Parameter Name Fuzzing with ffuf
+    # Phase 2F-apipath: API-style path fuzzing with ffuf
     # ===================================================================
+    # This appends words to the URL as a *path segment* (api/FUZZ) — useful
+    # for discovering REST resource names like /api/users, /api/orders.
+    # Real query-parameter discovery is in Phase 2F-paramname below.
     if ffuf.is_available():
         try:
-            # Find API-like endpoints to fuzz for hidden params
             api_endpoints = [u for u in live_host_urls if any(
                 kw in u.lower() for kw in ("/api", "/v1", "/v2", "/graphql")
             )]
             if not api_endpoints:
-                # Use root URLs as fallback
                 api_endpoints = live_host_urls[:3]
 
-            # Use the tiered wordlist resolver so we get assetnote params
-            # when available, SecLists burp-parameter-names as fallback.
             param_wordlist = ffuf.find_wordlist("params")
 
             if param_wordlist:
                 if progress_cb:
-                    await progress_cb(80, "Fuzzing parameter names", "ffuf")
+                    await progress_cb(79, "Fuzzing API path segments", "ffuf")
                 for api_url in api_endpoints[:3]:
-                    param_fuzz_result = await ffuf.execute(
+                    apath_result = await ffuf.execute(
                         api_url.rstrip("/") + "/FUZZ",
                         wordlist=param_wordlist,
                         wordlist_size="params",
                         timeout=60,
                     )
-                    if param_fuzz_result.success and param_fuzz_result.results:
-                        for entry in param_fuzz_result.results:
+                    if apath_result.success and apath_result.results:
+                        for entry in apath_result.results:
                             if isinstance(entry, dict):
                                 found_url = entry.get("url", "")
                                 if found_url:
-                                    all_urls.append({"url": found_url, "source": "ffuf_param"})
+                                    all_urls.append({"url": found_url, "source": "ffuf_apipath"})
         except Exception as exc:
-            warnings.append(f"Parameter fuzzing: {exc}")
+            warnings.append(f"API path fuzzing: {exc}")
+
+    # ===================================================================
+    # Phase 2F-paramname: Real query/body parameter name discovery
+    # ===================================================================
+    # Sends ?FUZZ=bughound and body FUZZ=bughound, uses ffuf -ac
+    # auto-calibration to filter the baseline response. A hit means the
+    # server consumed the param (response diverged from baseline).
+    hidden_param_names: list[dict[str, Any]] = []
+    if ffuf.is_available():
+        try:
+            param_wordlist = ffuf.find_wordlist("params")
+            if param_wordlist:
+                if progress_cb:
+                    await progress_cb(80, "Discovering hidden parameter names", "ffuf")
+
+                # Targets: API endpoints first, fall back to root URLs.
+                # Skip WAF-protected hosts (auto-calibration won't work).
+                _waf_hosts = {
+                    urlparse(w.get("url", "")).hostname
+                    for w in waf_results
+                    if w.get("detected")
+                }
+                api_endpoints = [u for u in live_host_urls if any(
+                    kw in u.lower() for kw in ("/api", "/v1", "/v2", "/graphql")
+                )][:3]
+                if not api_endpoints:
+                    api_endpoints = live_host_urls[:3]
+                api_endpoints = [
+                    u for u in api_endpoints
+                    if urlparse(u).hostname not in _waf_hosts
+                ]
+
+                for endpoint in api_endpoints:
+                    # GET first
+                    get_result = await ffuf.discover_params(
+                        endpoint,
+                        wordlist=param_wordlist,
+                        method="GET",
+                        timeout=90,
+                    )
+                    if get_result.success and get_result.results:
+                        hidden_param_names.extend(get_result.results)
+
+                    # POST body — only on /api endpoints (avoid noise on roots)
+                    if "/api" in endpoint.lower() or "/graphql" in endpoint.lower():
+                        post_result = await ffuf.discover_params(
+                            endpoint,
+                            wordlist=param_wordlist,
+                            method="POST",
+                            timeout=90,
+                        )
+                        if post_result.success and post_result.results:
+                            hidden_param_names.extend(post_result.results)
+        except Exception as exc:
+            warnings.append(f"Param-name discovery: {exc}")
+
+    if hidden_param_names:
+        await workspace.write_data(
+            workspace_id, "urls/hidden_param_names.json", hidden_param_names,
+            generated_by="ffuf_param_discovery", target=target_label,
+        )
+        files_written.append("urls/hidden_param_names.json")
+        # Feed back into all_urls as ?param=test URLs so test stage sees them
+        for hit in hidden_param_names:
+            base = hit.get("url", "")
+            param = hit.get("param", "")
+            if base and param and hit.get("method") == "GET":
+                sep = "&" if "?" in base else "?"
+                all_urls.append({
+                    "url": f"{base}{sep}{param}=bughound",
+                    "source": "ffuf_paramname",
+                })
+
+    # ===================================================================
+    # Phase 2F-merge: Re-dedup all_urls into unique_urls + re-write
+    # ===================================================================
+    # Phases 2C-spa, 2F-deep, and 2F-param appended to all_urls AFTER
+    # the initial unique_urls write. Without a second pass, arjun (2G),
+    # CMS detect, dynamic_urls, and the Stage 4 testing layer never see
+    # SPA routes, ffuf-discovered paths, or ffuf-discovered params.
+    new_url_count = 0
+    new_static = 0
+    new_oos = 0
+    for entry in all_urls:
+        u = _clean_url(entry.get("url", "") if isinstance(entry, dict) else "")
+        if not u or u in seen_urls:
+            continue
+        seen_urls.add(u)
+        if not scope_filter.allow(u):
+            new_oos += 1
+            continue
+        if _is_static_asset(u):
+            new_static += 1
+            continue
+        entry = {**entry, "url": u} if isinstance(entry, dict) else {"url": u}
+        unique_urls.append(entry)
+        new_url_count += 1
+
+    if new_url_count:
+        # Re-extract parameters and re-write urls/crawled.json so
+        # downstream stages (test, validate) see the post-Phase-2 picture.
+        params_by_path = _extract_parameters(unique_urls)
+        await workspace.write_data(
+            workspace_id, "urls/crawled.json", unique_urls,
+            generated_by="discover_phase2_merge", target=target_label,
+        )
+        if params_by_path:
+            await workspace.write_data(
+                workspace_id, "urls/parameters.json", params_by_path,
+                generated_by="discover_phase2_merge", target=target_label,
+            )
+        await workspace.update_stats(workspace_id, urls_discovered=len(unique_urls))
+        logger.info(
+            "discover.phase2_merge",
+            new_urls=new_url_count,
+            scope_dropped=new_oos,
+            static_dropped=new_static,
+            total=len(unique_urls),
+        )
+    if new_oos:
+        warnings.append(
+            f"scope: dropped {new_oos} out-of-scope URL(s) from late-stage discovery",
+        )
 
     # ===================================================================
     # Phase 2G: Light Parameter Discovery (arjun)

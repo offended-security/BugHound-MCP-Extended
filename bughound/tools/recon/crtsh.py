@@ -9,12 +9,22 @@ import asyncio
 
 import aiohttp
 import structlog
+import tldextract
 
 from bughound.schemas.models import ToolResult
 
 logger = structlog.get_logger()
 
 TIMEOUT = 30
+
+
+def _etld_plus_one(value: str) -> str:
+    if not value:
+        return ""
+    ext = tldextract.extract(value.strip().lower().lstrip("*."))
+    if not ext.domain or not ext.suffix:
+        return ""
+    return f"{ext.domain}.{ext.suffix}".lower()
 
 
 def is_available() -> bool:
@@ -60,15 +70,21 @@ async def execute(target: str, timeout: int = TIMEOUT) -> ToolResult:
 
     elapsed = time.monotonic() - start
 
-    # Parse: each entry has "name_value" which may contain multiple names
+    # Parse: each entry has "name_value" which may contain multiple names.
+    # Filter to the target's eTLD+1 — crt.sh SAN entries can include
+    # unrelated lookalike domains that pollute downstream probing.
+    target_etld = _etld_plus_one(target)
     subdomains: set[str] = set()
     if isinstance(data, list):
         for entry in data:
             name_value = entry.get("name_value", "")
             for name in name_value.split("\n"):
                 clean = name.strip().lower().lstrip("*.")
-                if clean and "." in clean:
-                    subdomains.add(clean)
+                if not clean or "." not in clean:
+                    continue
+                if target_etld and _etld_plus_one(clean) != target_etld:
+                    continue
+                subdomains.add(clean)
 
     deduped = sorted(subdomains)
     return ToolResult(
