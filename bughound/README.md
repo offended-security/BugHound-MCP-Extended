@@ -42,9 +42,9 @@ Add to your Claude Desktop configuration:
 ```json
 {
   "mcpServers": {
-    "bughound-recon": {
-      "command": "python",
-      "args": ["-m", "bughound.mcp_servers.recon_server"],
+    "bughound": {
+      "command": "python3",
+      "args": ["-m", "bughound.server"],
       "cwd": "/path/to/bughound"
     }
   }
@@ -65,7 +65,7 @@ Start a conversation with Claude and use natural language to perform security te
 
 ```
 bughound/
-├── mcp_servers/        # MCP server implementations
+├── server.py           # Single MCP server entry point
 ├── core/               # Core engine components
 ├── tools/              # Security tool wrappers
 ├── workspaces/         # Scan results and data

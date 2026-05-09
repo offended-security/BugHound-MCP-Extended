@@ -45,8 +45,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "bughound-recon=bughound.mcp_servers.recon_server:main",
-            "bughound-analyze=bughound.mcp_servers.analyze_server:main",
+            "bughound=bughound.cli:main",
+            "bughound-server=bughound.server:main",
         ],
     },
 )
