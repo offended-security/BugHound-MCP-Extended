@@ -26,15 +26,10 @@ structlog.configure(
     logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
 )
 
-from bughound.core import target_classifier, tool_runner, workspace
+from bughound import operations
+from bughound.core import workspace  # primitive reads (read_data, workspace_dir, etc.)
 from bughound.core.job_manager import JobManager, JobStatus
 from bughound.schemas.models import WorkspaceState
-from bughound.stages import analyze as stage_analyze
-from bughound.stages import discover as stage_discover
-from bughound.stages import enumerate as stage_enumerate
-from bughound.stages import test as stage_test
-from bughound.stages import report as stage_report
-from bughound.stages import validate as stage_validate
 
 # Shared job manager instance (lives for server lifetime)
 _job_manager = JobManager()
@@ -65,33 +60,28 @@ mcp = FastMCP("bughound")
 async def bughound_init(target: str, depth: str = "light") -> str:
     """Classify target and create workspace."""
     try:
-        classification = target_classifier.classify(target, depth)
+        init = await operations.create_workspace(target=target, depth=depth)
     except ValueError as exc:
         return f"Error: {exc}"
 
-    meta = await workspace.create_workspace(target, depth)
-
-    await workspace.update_metadata(
-        meta.workspace_id,
-        target_type=classification.target_type,
-        classification=classification.model_dump(mode="json"),
-    )
-    await workspace.add_stage_history(meta.workspace_id, 0, "completed")
+    classification = init["classification"]
+    workspace_id = init["workspace_id"]
+    ws_path = init["workspace_dir"]
+    stages_to_run = classification.get("stages_to_run", [])
+    skip_reasons = classification.get("skip_reasons", {})
+    normalized = classification.get("normalized_targets", [])
+    target_type_val = classification.get("target_type", "?")
 
     stage_names = {
         0: "Initialize", 1: "Enumerate", 2: "Discover",
         3: "Analyze", 4: "Test", 5: "Validate", 6: "Report",
     }
 
-    next_step = _suggest_next(classification.stages_to_run)
+    next_step = _suggest_next(stages_to_run)
 
-    ws_path = workspace.workspace_dir(meta.workspace_id)
-
-    # Build pipeline progress line
-    all_stages = classification.stages_to_run
     pipeline_parts = []
     for s in sorted(stage_names.keys()):
-        if s not in all_stages:
+        if s not in stages_to_run:
             continue
         if s == 0:
             pipeline_parts.append(f"Stage {s} [done]")
@@ -100,9 +90,9 @@ async def bughound_init(target: str, depth: str = "light") -> str:
     pipeline_line = " > ".join(pipeline_parts)
 
     skip_lines = ""
-    if classification.skip_reasons:
+    if skip_reasons:
         skip_lines = "\n  Skipped:\n"
-        for stage_num, reason in classification.skip_reasons.items():
+        for stage_num, reason in skip_reasons.items():
             skip_lines += f"    Stage {stage_num}: {reason}\n"
 
     header = "=" * 45
@@ -111,11 +101,11 @@ async def bughound_init(target: str, depth: str = "light") -> str:
         f"  BugHound -- Workspace Initialized\n"
         f"{header}\n\n"
         f"  Target:     {target}\n"
-        f"  Type:       {classification.target_type.value}\n"
+        f"  Type:       {target_type_val}\n"
         f"  Depth:      {depth}\n"
-        f"  Workspace:  {meta.workspace_id}\n"
+        f"  Workspace:  {workspace_id}\n"
         f"  Path:       {ws_path}\n"
-        f"  Normalized: {', '.join(classification.normalized_targets)}\n"
+        f"  Normalized: {', '.join(normalized)}\n"
         f"{skip_lines}\n"
         f"  Pipeline: {pipeline_line}\n\n"
         f"  Next: {next_step}\n"
@@ -132,15 +122,14 @@ async def bughound_init(target: str, depth: str = "light") -> str:
 )
 async def bughound_workspace_list(state: str = "") -> str:
     """List workspaces with optional state filter."""
-    state_filter = None
     if state:
         try:
-            state_filter = WorkspaceState(state.upper())
+            WorkspaceState(state.upper())  # Validate; operations also accepts strings.
         except ValueError:
             valid = ", ".join(s.value for s in WorkspaceState)
             return f"Error: Invalid state '{state}'. Valid states: {valid}"
 
-    workspaces = await workspace.list_workspaces(state_filter)
+    workspaces = await operations.list_workspaces(state or None)
 
     if not workspaces:
         return "No workspaces found. Use `bughound_init` to create one."
@@ -168,42 +157,47 @@ async def bughound_workspace_list(state: str = "") -> str:
 )
 async def bughound_workspace_get(workspace_id: str) -> str:
     """Get workspace metadata and config."""
-    meta = await workspace.get_workspace(workspace_id)
-    if meta is None:
+    detail = await operations.get_workspace_detail(workspace_id)
+    if detail is None:
         return f"Error: Workspace '{workspace_id}' not found. Run `bughound_init` first."
 
-    cfg = await workspace.get_config(workspace_id)
-    s = meta.stats
+    meta = detail["metadata"]
+    cfg = detail.get("config")
+    s = meta.get("stats", {})
 
     stage_history = ""
-    if meta.stage_history:
+    history = meta.get("stage_history", [])
+    if history:
         stage_history = "\n**Stage History:**\n"
-        for entry in meta.stage_history:
-            stage_history += f"  - Stage {entry.stage}: {entry.status}\n"
+        for entry in history:
+            stage_history += f"  - Stage {entry['stage']}: {entry['status']}\n"
 
     scope_str = ""
     if cfg:
+        scope = cfg.get("scope", {})
         scope_str = (
             f"\n**Scope:**\n"
-            f"  - Include: {', '.join(cfg.scope.include) or 'all'}\n"
-            f"  - Exclude: {', '.join(cfg.scope.exclude) or 'none'}\n"
+            f"  - Include: {', '.join(scope.get('include', [])) or 'all'}\n"
+            f"  - Exclude: {', '.join(scope.get('exclude', [])) or 'none'}\n"
         )
 
+    target_type = meta.get("target_type") or "not classified"
+
     return (
-        f"## Workspace: {meta.workspace_id}\n\n"
-        f"**Target:** {meta.target}\n"
-        f"**Target Type:** {meta.target_type.value if meta.target_type else 'not classified'}\n"
-        f"**State:** {meta.state.value}\n"
-        f"**Depth:** {meta.depth}\n"
-        f"**Current Stage:** {meta.current_stage}\n"
-        f"**Created:** {meta.created_at}\n"
-        f"**Updated:** {meta.updated_at}\n\n"
+        f"## Workspace: {meta['workspace_id']}\n\n"
+        f"**Target:** {meta['target']}\n"
+        f"**Target Type:** {target_type}\n"
+        f"**State:** {meta['state']}\n"
+        f"**Depth:** {meta['depth']}\n"
+        f"**Current Stage:** {meta['current_stage']}\n"
+        f"**Created:** {meta['created_at']}\n"
+        f"**Updated:** {meta['updated_at']}\n\n"
         f"**Stats:**\n"
-        f"  - Subdomains found: {s.subdomains_found}\n"
-        f"  - Live hosts: {s.live_hosts}\n"
-        f"  - URLs discovered: {s.urls_discovered}\n"
-        f"  - Findings total: {s.findings_total}\n"
-        f"  - Findings confirmed: {s.findings_confirmed}\n"
+        f"  - Subdomains found: {s.get('subdomains_found', 0)}\n"
+        f"  - Live hosts: {s.get('live_hosts', 0)}\n"
+        f"  - URLs discovered: {s.get('urls_discovered', 0)}\n"
+        f"  - Findings total: {s.get('findings_total', 0)}\n"
+        f"  - Findings confirmed: {s.get('findings_confirmed', 0)}\n"
         f"{stage_history}"
         f"{scope_str}"
     )
@@ -218,13 +212,10 @@ async def bughound_workspace_get(workspace_id: str) -> str:
 )
 async def bughound_workspace_delete(workspace_id: str) -> str:
     """Delete a workspace."""
-    if not workspace.workspace_exists(workspace_id):
-        return f"Error: Workspace '{workspace_id}' not found."
-
-    deleted = await workspace.delete_workspace(workspace_id)
+    deleted = await operations.delete_workspace(workspace_id)
     if deleted:
         return f"Workspace `{workspace_id}` deleted successfully."
-    return f"Error: Failed to delete workspace '{workspace_id}'."
+    return f"Error: Workspace '{workspace_id}' not found."
 
 
 @mcp.tool(
@@ -243,73 +234,47 @@ async def bughound_workspace_delete(workspace_id: str) -> str:
 )
 async def bughound_workspace_results(workspace_id: str, category: str = "") -> str:
     """View workspace data dashboard or drill into a specific category."""
-    meta = await workspace.get_workspace(workspace_id)
-    if meta is None:
-        return f"Error: Workspace '{workspace_id}' not found."
-
     if not category:
-        return await _results_dashboard(workspace_id, meta)
-    return await _results_category(workspace_id, meta, category.strip().lower())
+        return await _results_dashboard(workspace_id)
+    return await _results_category(workspace_id, category.strip().lower())
 
 
-async def _results_dashboard(workspace_id: str, meta: Any) -> str:
+async def _results_dashboard(workspace_id: str) -> str:
     """Build a dashboard overview of all workspace data."""
-    # Category definitions: (label, file_path)
-    categories = [
-        ("subdomains", "subdomains/all.txt"),
-        ("dns_records", "dns/records.json"),
-        ("live_hosts", "hosts/live_hosts.json"),
-        ("technologies", "hosts/technologies.json"),
-        ("waf", "hosts/waf.json"),
-        ("flags", "hosts/flags.json"),
-        ("urls", "urls/crawled.json"),
-        ("parameters", "urls/parameters.json"),
-        ("js_secrets", "secrets/js_secrets.json"),
-        ("js_secrets_confirmed", "secrets/js_secrets_confirmed.json"),
-        ("hidden_endpoints", "endpoints/hidden_endpoints.json"),
-        ("api_endpoints", "endpoints/api_endpoints.json"),
-        ("sensitive_paths", "hosts/sensitive_paths.json"),
-        ("cors_results", "hosts/cors_results.json"),
-        ("takeover_candidates", "cloud/takeover_candidates.json"),
-        ("takeover_confirmed", "cloud/takeover_confirmed.json"),
-        ("vulnerabilities", "vulnerabilities/scan_results.json"),
-        ("attack_surface", "analysis/attack_surface.json"),
-    ]
+    dash = await operations.get_workspace_dashboard(workspace_id)
+    if dash is None:
+        return f"Error: Workspace '{workspace_id}' not found."
 
     lines = [
         f"## Workspace Dashboard: `{workspace_id}`\n",
-        f"**Target:** {meta.target}",
-        f"**State:** {meta.state.value}",
-        f"**Current Stage:** {meta.current_stage}\n",
+        f"**Target:** {dash['target']}",
+        f"**State:** {dash['state']}",
+        f"**Current Stage:** {dash['current_stage']}\n",
         "**Data Collected:**",
     ]
 
-    for label, file_path in categories:
-        data = await workspace.read_data(workspace_id, file_path)
-        if data is None:
+    for cat in dash["categories"]:
+        label = cat["name"]
+        path = cat["path"]
+        count = cat["count"]
+        if count is None:
             lines.append(f"  - {label}: —")
-        elif isinstance(data, list):
-            lines.append(f"  - **{label}**: {len(data)} entries  (`{file_path}`)")
-        elif isinstance(data, dict):
-            count = data.get("count", len(data.get("data", [])))
-            lines.append(f"  - **{label}**: {count} entries  (`{file_path}`)")
-
-    # Stages
-    completed = [e.stage for e in meta.stage_history if e.status == "completed"]
-    all_stages = meta.classification.get("stages_to_run", []) if meta.classification else list(range(7))
-    pending = [s for s in all_stages if s not in completed]
+        else:
+            lines.append(f"  - **{label}**: {count} entries  (`{path}`)")
 
     stage_names = {
         0: "Initialize", 1: "Enumerate", 2: "Discover",
         3: "Analyze", 4: "Test", 5: "Validate", 6: "Report",
     }
+    completed = dash["stages_completed"]
+    pending = dash["stages_pending"]
     completed_str = ", ".join(f"{s} ({stage_names.get(s, '?')})" for s in completed)
     pending_str = ", ".join(f"{s} ({stage_names.get(s, '?')})" for s in pending)
 
     lines.append(f"\n**Stages completed:** {completed_str or 'none'}")
     lines.append(f"**Stages pending:** {pending_str or 'none'}")
 
-    # Available drill-down categories
+    # Available drill-down categories (canonical from operations)
     lines.append(
         "\n**Drill down:** call with category = subdomains | dns | hosts | flags | "
         "technologies | urls | parameters | secrets | js_secrets_confirmed | "
@@ -320,78 +285,34 @@ async def _results_dashboard(workspace_id: str, meta: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-# Category -> (file_path, truncate_limit or 0 for no truncation)
-_CATEGORY_MAP: dict[str, tuple[str, int]] = {
-    "subdomains": ("subdomains/all.txt", 100),
-    "dns": ("dns/records.json", 0),
-    "dns_records": ("dns/records.json", 0),
-    "hosts": ("hosts/live_hosts.json", 0),
-    "live_hosts": ("hosts/live_hosts.json", 0),
-    "flags": ("hosts/flags.json", 0),
-    "technologies": ("hosts/technologies.json", 0),
-    "urls": ("urls/crawled.json", 100),
-    "parameters": ("urls/parameters.json", 0),
-    "secrets": ("secrets/js_secrets.json", 0),
-    "js_secrets": ("secrets/js_secrets.json", 0),
-    "js_secrets_confirmed": ("secrets/js_secrets_confirmed.json", 0),
-    "hidden_endpoints": ("endpoints/hidden_endpoints.json", 0),
-    "api_endpoints": ("endpoints/api_endpoints.json", 0),
-    "sensitive_paths": ("hosts/sensitive_paths.json", 0),
-    "cors": ("hosts/cors_results.json", 0),
-    "cors_results": ("hosts/cors_results.json", 0),
-    "takeover": ("cloud/takeover_candidates.json", 0),
-    "takeover_candidates": ("cloud/takeover_candidates.json", 0),
-    "takeover_confirmed": ("cloud/takeover_confirmed.json", 0),
-    "vulnerabilities": ("vulnerabilities/scan_results.json", 0),
-    "waf": ("hosts/waf.json", 0),
-    "attack_surface": ("analysis/attack_surface.json", 0),
-    "scan_plan": ("scan_plan.json", 0),
-    "findings": ("vulnerabilities/scan_results.json", 0),
-    "param_classification": ("urls/parameter_classification.json", 0),
-    "dynamic_urls": ("urls/dynamic_urls.json", 50),
-    "api_urls": ("urls/api_urls.json", 50),
-    "admin_urls": ("urls/admin_urls.json", 50),
-    "forms": ("urls/forms.json", 0),
-}
-
-
-async def _results_category(workspace_id: str, meta: Any, category: str) -> str:
+async def _results_category(workspace_id: str, category: str) -> str:
     """Return actual data for a specific category, human-formatted."""
-    if category not in _CATEGORY_MAP:
-        valid = ", ".join(sorted(_CATEGORY_MAP.keys()))
+    result = await operations.get_workspace_category(workspace_id, category)
+    status = result.get("status")
+
+    if status == "not_found":
+        return f"Error: Workspace '{workspace_id}' not found."
+    if status == "unknown_category":
+        valid = ", ".join(result.get("valid", []))
         return f"Error: Unknown category '{category}'. Valid categories: {valid}"
-
-    file_path, truncate_limit = _CATEGORY_MAP[category]
-    data = await workspace.read_data(workspace_id, file_path)
-
-    if data is None:
+    if status == "no_data":
         return (
             f"## {category} — No Data\n\n"
-            f"File `{file_path}` does not exist yet. "
+            f"File `{result['path']}` does not exist yet. "
             f"This data is collected during a later pipeline stage."
         )
 
-    # Special handling for attack_surface (full analysis result, not a list)
+    # attack_surface returns a single dict, not a list — format with the
+    # attack-surface formatter directly.
     if category == "attack_surface":
-        if isinstance(data, dict) and "data" in data:
-            # DataWrapper envelope — unwrap
-            return _format_attack_surface(data["data"])
-        return _format_attack_surface(data)
+        return _format_attack_surface(result["items"])
 
-    # Extract items from DataWrapper envelope or plain list
-    if isinstance(data, dict):
-        items = data.get("data", [])
-        total = data.get("count", len(items))
-    elif isinstance(data, list):
-        items = data
-        total = len(data)
-    else:
-        items, total = [], 0
+    items = result["items"]
+    total = result["total"]
+    truncate_limit = result.get("truncate_limit", 0)
 
-    lines = [f"## {category} — `{workspace_id}`\n"]
-    lines.append(f"**Total:** {total}\n")
+    lines = [f"## {category} — `{workspace_id}`\n", f"**Total:** {total}\n"]
 
-    # Use per-category formatter if available, else generic
     formatter = _CATEGORY_FORMATTERS.get(category)
     if formatter:
         show = items[:truncate_limit] if truncate_limit else items
@@ -658,7 +579,7 @@ _CATEGORY_FORMATTERS: dict[str, Any] = {
 )
 async def bughound_enumerate(workspace_id: str) -> str:
     """Run light subdomain enumeration."""
-    result = await stage_enumerate.enumerate_light(workspace_id)
+    result = await operations.enumerate_light(workspace_id)
     return _format_enumerate(result)
 
 
@@ -673,7 +594,7 @@ async def bughound_enumerate(workspace_id: str) -> str:
 )
 async def bughound_enumerate_deep(workspace_id: str) -> str:
     """Start deep enumeration as a background job."""
-    result = await stage_enumerate.enumerate_deep(workspace_id, _job_manager)
+    result = await operations.enumerate_deep(workspace_id, _job_manager)
     return _format_job_started(result)
 
 
@@ -709,7 +630,9 @@ async def bughound_discover(workspace_id: str, targets: str = "") -> str:
     if targets and targets.strip():
         target_list = [t.strip() for t in targets.split(",") if t.strip()]
 
-    result = await stage_discover.discover(workspace_id, _job_manager, target_list)
+    result = await operations.discover(
+        workspace_id, job_manager=_job_manager, target_subset=target_list,
+    )
     return _format_discover(result)
 
 
@@ -732,7 +655,7 @@ async def bughound_discover(workspace_id: str, targets: str = "") -> str:
 )
 async def bughound_get_attack_surface(workspace_id: str) -> str:
     """Analyze full attack surface from Stage 2 data."""
-    result = await stage_analyze.get_attack_surface(workspace_id)
+    result = await operations.get_attack_surface(workspace_id)
     return _format_attack_surface(result)
 
 
@@ -747,22 +670,21 @@ async def bughound_get_attack_surface(workspace_id: str) -> str:
 )
 async def bughound_analyze_host(workspace_id: str, host: str) -> str:
     """Get detailed analysis for a single host."""
-    result = await stage_analyze.get_attack_surface(workspace_id)
+    result = await operations.get_attack_surface_for_host(workspace_id, host)
+
     if result.get("status") == "error":
         return f"Error: {result['message']}"
+    if result.get("status") == "not_found":
+        available = result.get("available_hosts", [])
+        return f"Host '{host}' not found. Available hosts:\n" + "\n".join(
+            f"  - {h}" for h in available
+        )
 
-    # Find this host in the scored targets
-    all_targets = result.get("high_interest_targets", [])
-    host_lower = host.strip().lower()
-    target = None
-    for t in all_targets:
-        if t.get("host", "").lower() == host_lower:
-            target = t
-            break
-
-    if not target:
-        available = [t.get("host", "?") for t in all_targets[:10]]
-        return f"Host '{host}' not found. Available hosts:\n" + "\n".join(f"  - {h}" for h in available)
+    target = result["target"]
+    host_probes = result["host_probes"]
+    host_candidates = result["host_candidates"]
+    host_chains = result["host_chains"]
+    suggested = result.get("suggested_test_classes", [])
 
     hdr = "=" * 45
     lines = [
@@ -781,31 +703,17 @@ async def bughound_analyze_host(workspace_id: str, host: str) -> str:
         for f in target["flags"]:
             lines.append(f"    - {f}")
 
-    # Probe-confirmed vulns
-    pc = result.get("parameter_classification", {})
-    probe_confirmed = pc.get("probe_confirmed", [])
-    host_probes = [p for p in probe_confirmed if host_lower in p.get("url", "").lower()]
     if host_probes:
         lines.append(f"\n  Probe-Confirmed Vulnerabilities ({len(host_probes)}):")
         for p in host_probes[:10]:
             lines.append(f"    [{p['vuln_type'].upper()}] {p['url'][:55]} param={p['param']}")
 
-    # Top candidates for this host
-    top_by_type = pc.get("top_candidates_by_type", {})
-    host_candidates = {}
-    for vtype, cands in top_by_type.items():
-        hc = [c for c in cands if host_lower in c.get("url", "").lower()]
-        if hc:
-            host_candidates[vtype] = hc
     if host_candidates:
         lines.append(f"\n  Vulnerable Parameters:")
         for vtype, cands in host_candidates.items():
             for c in cands[:3]:
                 lines.append(f"    [{vtype.upper()}] {c.get('url', '?')[:50]} param={c.get('param', '?')}")
 
-    # Attack chains involving this host
-    chains = result.get("attack_chains", [])
-    host_chains = [c for c in chains if host_lower in str(c.get("affected_hosts", [])).lower()]
     if host_chains:
         lines.append(f"\n  Attack Chains ({len(host_chains)}):")
         for c in host_chains[:5]:
@@ -814,13 +722,12 @@ async def bughound_analyze_host(workspace_id: str, host: str) -> str:
             for s in steps[:3]:
                 lines.append(f"      {s}")
 
-    # Reasoning
     if target.get("reasons"):
         lines.append(f"\n  Why this host is interesting:")
         for r in target["reasons"]:
             lines.append(f"    - {r}")
 
-    lines.append(f"\n  Suggested test classes: {', '.join(result.get('suggested_test_classes', []))}")
+    lines.append(f"\n  Suggested test classes: {', '.join(suggested)}")
 
     return "\n".join(lines) + "\n"
 
@@ -836,13 +743,14 @@ async def bughound_analyze_host(workspace_id: str, host: str) -> str:
 )
 async def bughound_get_immediate_wins(workspace_id: str) -> str:
     """Get report-ready findings from discovery data."""
-    result = await stage_analyze.get_attack_surface(workspace_id)
+    result = await operations.get_immediate_wins(workspace_id)
+
     if result.get("status") == "error":
         return f"Error: {result['message']}"
+    if result.get("status") == "empty":
+        return result.get("message", "No immediate wins found.")
 
-    wins = result.get("immediate_wins", [])
-    if not wins:
-        return "No immediate wins found. All findings require testing to confirm."
+    wins = result["wins"]
 
     hdr = "=" * 45
     lines = [
@@ -914,7 +822,7 @@ async def bughound_submit_scan_plan(workspace_id: str, scan_plan: dict | str) ->
             "status": "error",
             "message": f"scan_plan must be a JSON object/dict, got {type(parsed).__name__}",
         })
-    result = await stage_analyze.submit_scan_plan(workspace_id, parsed)
+    result = await operations.submit_scan_plan(workspace_id, parsed)
     return _format_scan_plan_result(result)
 
 
@@ -929,7 +837,7 @@ async def bughound_submit_scan_plan(workspace_id: str, scan_plan: dict | str) ->
 )
 async def bughound_enrich_target(workspace_id: str, host: str) -> str:
     """Get all workspace intelligence for one host."""
-    result = await stage_analyze.enrich_target(workspace_id, host)
+    result = await operations.enrich_target(workspace_id, host)
     return _format_enrich_target(result)
 
 
@@ -942,17 +850,20 @@ async def bughound_enrich_target(workspace_id: str, host: str) -> str:
 )
 async def bughound_scope_check(workspace_id: str, target: str) -> str:
     """Check scope for a target."""
-    if not workspace.workspace_exists(workspace_id):
+    result = await operations.check_scope(workspace_id, target)
+    if result.get("status") == "not_found":
         return f"Error: Workspace '{workspace_id}' not found."
-    in_scope = await workspace.is_in_scope(workspace_id, target)
-    cfg = await workspace.get_config(workspace_id)
-    scope_rules = ""
-    if cfg:
-        scope_rules = (
-            f"\n**Scope rules:**\n"
-            f"  - Include: {', '.join(cfg.scope.include) or 'all'}\n"
-            f"  - Exclude: {', '.join(cfg.scope.exclude) or 'none'}"
-        )
+
+    in_scope = result.get("in_scope", False)
+    scope = result.get("scope", {})
+    include = scope.get("include", [])
+    exclude = scope.get("exclude", [])
+
+    scope_rules = (
+        f"\n**Scope rules:**\n"
+        f"  - Include: {', '.join(include) or 'all'}\n"
+        f"  - Exclude: {', '.join(exclude) or 'none'}"
+    )
     status = "IN SCOPE" if in_scope else "OUT OF SCOPE"
     return f"## Scope Check\n\n**Target:** {target}\n**Result:** {status}{scope_rules}\n"
 
@@ -967,93 +878,56 @@ async def bughound_scope_check(workspace_id: str, target: str) -> str:
 )
 async def bughound_check_tool_coverage() -> str:
     """Check installed security tools."""
-    tools_info = {
-        "subfinder": "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
-        "httpx": "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest",
-        "nuclei": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
-        "ffuf": "go install github.com/ffuf/ffuf/v2@latest",
-        "sqlmap": "pip install sqlmap",
-        "dalfox": "go install github.com/hahwul/dalfox/v2@latest",
-        "katana": "go install github.com/projectdiscovery/katana/cmd/katana@latest",
-        "gospider": "go install github.com/jaeles-project/gospider@latest",
-        "wafw00f": "pip install wafw00f",
-        "amass": "go install -v github.com/owasp-amass/amass/v4/...@master",
-        "gau": "go install github.com/lc/gau/v2/cmd/gau@latest",
-        "waybackurls": "go install github.com/tomnomnom/waybackurls@latest",
-        "puredns": "go install github.com/d3mondev/puredns/v2@latest",
-        "gotator": "go install github.com/Josue87/gotator@latest",
-        "subjack": "go install github.com/haccer/subjack@latest",
-        "arjun": "pip install arjun",
-        "interactsh-client": "go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest",
-        "trufflehog": "pip install trufflehog",
-        "findomain": "apt install findomain",
-        "assetfinder": "go install github.com/tomnomnom/assetfinder@latest",
-    }
+    coverage = operations.check_tool_coverage()
 
-    available: list[str] = []
-    missing: list[tuple[str, str]] = []
-    for tool_name, install_cmd in sorted(tools_info.items()):
-        if tool_runner.is_available(tool_name):
-            available.append(tool_name)
-        else:
-            missing.append((tool_name, install_cmd))
+    # All non-oneliner tools share the "main" view; oneliners get their own section.
+    main_installed = [t for t in coverage.installed if t.category != "oneliner"]
+    main_missing = [
+        t for t in (coverage.missing_critical + coverage.missing_optional)
+        if t.category != "oneliner"
+    ]
+    main_total = main_installed.__len__() + main_missing.__len__()
 
     lines = [
         "## Tool Coverage\n",
-        f"**Available:** {len(available)}/{len(tools_info)}\n",
+        f"**Available:** {len(main_installed)}/{main_total}\n",
     ]
 
-    if available:
+    if main_installed:
         lines.append("**Installed:**")
-        for t in available:
-            lines.append(f"  - {t}")
+        for t in sorted(main_installed, key=lambda x: x.name):
+            lines.append(f"  - {t.name}")
         lines.append("")
 
-    if missing:
+    if main_missing:
         lines.append("**Missing (with install commands):**")
-        for t, cmd in missing:
-            lines.append(f"  - **{t}**: `{cmd}`")
+        for t in sorted(main_missing, key=lambda x: x.name):
+            lines.append(f"  - **{t.name}**: `{t.install_cmd}`")
         lines.append("")
 
-    # Coverage by category
-    recon_tools = {"subfinder", "assetfinder", "findomain", "amass", "httpx", "wafw00f"}
-    discovery_tools = {"gau", "waybackurls", "katana", "gospider"}
-    scanning_tools = {"nuclei", "ffuf", "sqlmap", "dalfox"}
-    recon_avail = len(recon_tools & set(available))
-    disc_avail = len(discovery_tools & set(available))
-    scan_avail = len(scanning_tools & set(available))
+    # Coverage by category (uses operations' canonical category breakdown)
     lines.append("**Coverage by category:**")
-    lines.append(f"  - Recon: {recon_avail}/{len(recon_tools)}")
-    lines.append(f"  - Discovery: {disc_avail}/{len(discovery_tools)}")
-    lines.append(f"  - Scanning: {scan_avail}/{len(scanning_tools)}")
+    for cat in ("recon", "discovery", "scanning", "validation", "secrets",
+                "cms", "takeover", "oob"):
+        c = coverage.by_category.get(cat)
+        if c and c["total"]:
+            lines.append(f"  - {cat.title()}: {c['installed']}/{c['total']}")
 
-    # One-liner tools (all have Python fallbacks)
-    oneliner_tools_info = {
-        "qsreplace": "go install github.com/tomnomnom/qsreplace@latest",
-        "kxss": "go install github.com/Emoe/kxss@latest",
-        "gf": "go install github.com/tomnomnom/gf@latest",
-        "uro": "pip install uro",
-        "unfurl": "go install github.com/tomnomnom/unfurl@latest",
-        "anew": "go install github.com/tomnomnom/anew@latest",
-        "Gxss": "go install github.com/KathanP19/Gxss@latest",
-        "bhedak": "pipx install bhedak",
-        "urldedupe": "git clone https://github.com/ameenmaali/urldedupe && cd urldedupe && cmake . && make",
-        "interlace": "pipx install git+https://github.com/codingo/Interlace.git",
-    }
-    oneliner_avail = []
-    oneliner_missing = []
-    for t, cmd in sorted(oneliner_tools_info.items()):
-        if tool_runner.is_available(t):
-            oneliner_avail.append(t)
-        else:
-            oneliner_missing.append((t, cmd))
-
-    lines.append(f"  - One-liners: {len(oneliner_avail)}/{len(oneliner_tools_info)} "
-                 f"(all have Python fallbacks)")
+    # One-liners (all have Python fallbacks, displayed separately)
+    oneliner_installed = [t for t in coverage.installed if t.category == "oneliner"]
+    oneliner_missing = [
+        t for t in (coverage.missing_critical + coverage.missing_optional)
+        if t.category == "oneliner"
+    ]
+    oneliner_total = len(oneliner_installed) + len(oneliner_missing)
+    lines.append(
+        f"  - One-liners: {len(oneliner_installed)}/{oneliner_total} "
+        f"(all have Python fallbacks)"
+    )
     if oneliner_missing:
         lines.append("\n**One-liner tools (optional, faster with native binary):**")
-        for t, cmd in oneliner_missing:
-            lines.append(f"  - **{t}**: `{cmd}`")
+        for t in sorted(oneliner_missing, key=lambda x: x.name):
+            lines.append(f"  - **{t.name}**: `{t.install_cmd}`")
 
     return "\n".join(lines) + "\n"
 
@@ -1086,8 +960,9 @@ async def bughound_execute_tests(
     test_profile: str = "both",
 ) -> str:
     """Run the scan plan."""
-    result = await stage_test.execute_tests(
-        workspace_id, _job_manager,
+    result = await operations.execute_tests(
+        workspace_id,
+        job_manager=_job_manager,
         test_profile=test_profile if test_profile in ("client", "server", "both") else "both",
     )
     if result.get("status") == "job_started":
@@ -1115,7 +990,7 @@ async def bughound_test_single(
     technique: str = "",
 ) -> str:
     """Test one specific endpoint."""
-    result = await stage_test.test_single(
+    result = await operations.test_single(
         workspace_id, target_url, tool,
         tags=tags or None,
         severity=severity or None,
@@ -1135,14 +1010,10 @@ async def bughound_test_single(
 )
 async def bughound_list_techniques(test_profile: str = "both") -> str:
     """List available testing techniques. Optional test_profile filter."""
-    from bughound.stages.techniques import (
-        list_all_techniques, filter_techniques_by_profile, VALID_PROFILES,
-    )
-    techs = list_all_techniques()
-    if test_profile not in VALID_PROFILES:
+    techs = operations.list_techniques(test_profile)
+    # operations normalizes invalid profiles to 'both'
+    if test_profile not in ("client", "server", "both"):
         test_profile = "both"
-    if test_profile != "both":
-        techs = filter_techniques_by_profile(techs, test_profile)
 
     lines = [f"# Available Testing Techniques (profile={test_profile})\n"]
     by_phase: dict[str, list] = {}
@@ -1192,76 +1063,30 @@ async def bughound_nuclei_scan(
     extra_args: str = "",
 ) -> str:
     """Direct nuclei scan with flexible targeting."""
-    from bughound.tools.scanning import nuclei
-    from bughound.stages.test import (
-        _process_nuclei_findings,
-        _deduplicate_nuclei_findings,
-        _append_findings,
+    result = await operations.nuclei_scan(
+        workspace_id,
+        target=target,
+        target_source=target_source,
+        tags=tags,
+        severity=severity,
+        template_path=template_path,
+        extra_args=extra_args,
     )
 
-    if not nuclei.is_available():
-        return json.dumps({"status": "error", "message": "nuclei is not installed."})
+    if result.get("status") == "error":
+        payload: dict[str, Any] = {"status": "error", "message": result["message"]}
+        if "valid_sources" in result:
+            payload["target_source_options"] = result["valid_sources"]
+        return json.dumps(payload)
 
-    if not target and not target_source:
-        return json.dumps({
-            "status": "error",
-            "message": "Provide either 'target' (single URL) or 'target_source' (workspace URL list).",
-            "target_source_options": [
-                "all_urls", "dynamic_urls", "js_files", "live_hosts",
-                "api_endpoints", "admin_paths", "forms",
-            ],
-        })
+    findings = result["findings"]
+    sev_counts = result["severity_breakdown"]
+    scan_urls_count = result["scan_urls_count"]
 
-    # Resolve targets
-    scan_urls: list[str] = []
-
-    if target:
-        scan_urls = [target]
-    elif target_source:
-        scan_urls = await _resolve_nuclei_targets(workspace_id, target_source)
-        if not scan_urls:
-            return json.dumps({
-                "status": "error",
-                "message": f"No URLs found for target_source='{target_source}'.",
-            })
-
-    # Build nuclei kwargs
-    nuclei_kwargs: dict[str, Any] = {}
-    if tags:
-        nuclei_kwargs["tags"] = [t.strip() for t in tags.split(",")]
-    if severity:
-        nuclei_kwargs["severity"] = severity
-    if template_path:
-        nuclei_kwargs["template_path"] = template_path
-
-    # Run nuclei
-    nuclei_target = scan_urls[0] if len(scan_urls) == 1 else scan_urls
-    result = await nuclei.execute(nuclei_target, **nuclei_kwargs)
-
-    if not result.success:
-        err = result.error.message if result.error else "nuclei execution failed"
-        return json.dumps({"status": "error", "message": err})
-
-    # Process and deduplicate
-    raw = result.results if isinstance(result.results, list) else []
-    findings = _process_nuclei_findings(raw, workspace_id)
-    findings = _deduplicate_nuclei_findings(findings)
-
-    # Append to workspace
-    if findings:
-        await _append_findings(workspace_id, findings)
-
-    # Severity breakdown
-    sev_counts: dict[str, int] = {}
-    for f in findings:
-        s = f.get("severity", "unknown")
-        sev_counts[s] = sev_counts.get(s, 0) + 1
-
-    # Format response
     lines = [f"## Nuclei Scan Results\n"]
     source_label = f"target={target}" if target else f"target_source={target_source}"
     lines.append(f"**Scan:** {source_label}")
-    lines.append(f"**URLs scanned:** {len(scan_urls)}")
+    lines.append(f"**URLs scanned:** {scan_urls_count}")
     if tags:
         lines.append(f"**Tags:** {tags}")
     lines.append(f"**Findings:** {len(findings)}\n")
@@ -1288,71 +1113,6 @@ async def bughound_nuclei_scan(
     return "\n".join(lines)
 
 
-async def _resolve_nuclei_targets(workspace_id: str, source: str) -> list[str]:
-    """Resolve target_source to a list of URLs from workspace data."""
-    urls: list[str] = []
-
-    if source == "all_urls":
-        data = await workspace.read_data(workspace_id, "urls/crawled.json")
-        items = data.get("data", []) if isinstance(data, dict) else (data or [])
-        urls = [u.get("url", u) if isinstance(u, dict) else str(u) for u in items]
-
-    elif source == "dynamic_urls":
-        data = await workspace.read_data(workspace_id, "urls/dynamic_urls.json")
-        items = data.get("data", []) if isinstance(data, dict) else (data or [])
-        urls = [u.get("url", u) if isinstance(u, dict) else str(u) for u in items]
-
-    elif source == "js_files":
-        data = await workspace.read_data(workspace_id, "urls/js_files.json")
-        items = data.get("data", []) if isinstance(data, dict) else (data or [])
-        urls = [u.get("url", u) if isinstance(u, dict) else str(u) for u in items]
-
-    elif source == "live_hosts":
-        data = await workspace.read_data(workspace_id, "hosts/live_hosts.json")
-        items = data.get("data", []) if isinstance(data, dict) else (data or [])
-        urls = [h.get("url", "") for h in items if isinstance(h, dict) and h.get("url")]
-
-    elif source == "api_endpoints":
-        # Combine api_endpoints + openapi_specs
-        api_data = await workspace.read_data(workspace_id, "endpoints/api_endpoints.json")
-        api_items = api_data.get("data", []) if isinstance(api_data, dict) else (api_data or [])
-        for ep in api_items:
-            if isinstance(ep, dict) and ep.get("url"):
-                urls.append(ep["url"])
-
-        oas_data = await workspace.read_data(workspace_id, "endpoints/openapi_specs.json")
-        oas_items = oas_data.get("data", []) if isinstance(oas_data, dict) else (oas_data or [])
-        for spec in oas_items:
-            if isinstance(spec, dict):
-                for endpoint in spec.get("endpoints", []):
-                    if isinstance(endpoint, dict) and endpoint.get("url"):
-                        urls.append(endpoint["url"])
-
-    elif source == "admin_paths":
-        data = await workspace.read_data(workspace_id, "urls/admin_urls.json")
-        items = data.get("data", []) if isinstance(data, dict) else (data or [])
-        urls = [u.get("url", u) if isinstance(u, dict) else str(u) for u in items]
-
-    elif source == "forms":
-        data = await workspace.read_data(workspace_id, "urls/forms.json")
-        items = data.get("data", []) if isinstance(data, dict) else (data or [])
-        for form in items:
-            if isinstance(form, dict) and form.get("method", "").upper() == "GET":
-                test_url = form.get("testable_url", form.get("action", ""))
-                if test_url:
-                    urls.append(test_url)
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique: list[str] = []
-    for u in urls:
-        if u and u not in seen:
-            seen.add(u)
-            unique.append(u)
-
-    return unique
-
-
 # ---------------------------------------------------------------------------
 # One-liner Pipelines
 # ---------------------------------------------------------------------------
@@ -1372,9 +1132,7 @@ async def _resolve_nuclei_targets(workspace_id: str, source: str) -> list[str]:
 )
 async def bughound_run_pipeline(workspace_id: str, pipeline_id: str) -> str:
     """Run a one-liner pipeline."""
-    from bughound.tools.oneliners.pipeline import run_pipeline
-
-    result = await run_pipeline(pipeline_id, workspace_id)
+    result = await operations.run_pipeline(workspace_id, pipeline_id)
     return _format_pipeline_result(result)
 
 
@@ -1387,10 +1145,9 @@ async def bughound_run_pipeline(workspace_id: str, pipeline_id: str) -> str:
 )
 async def bughound_list_pipelines() -> str:
     """List available one-liner pipelines."""
-    from bughound.tools.oneliners.pipeline import list_pipelines, _tools_used_summary
-
-    pipelines = list_pipelines()
-    tools = _tools_used_summary()
+    info = operations.list_pipelines()
+    pipelines = info["pipelines"]
+    tools = info["tools_used"]
 
     lines = ["# One-liner Pipelines\n"]
     for p in pipelines:
@@ -1429,7 +1186,7 @@ async def bughound_validate_finding(
     tool: str = "",
 ) -> str:
     """Validate a single finding."""
-    result = await stage_validate.validate_finding(
+    result = await operations.validate_finding(
         workspace_id, finding_id, tool=tool or None,
     )
     return _format_validation_result(result)
@@ -1447,32 +1204,12 @@ async def bughound_validate_finding(
 )
 async def bughound_validate_all(workspace_id: str) -> str:
     """Batch-validate all findings."""
-    # Run as background job to avoid MCP client timeout
-    try:
-        job_id = await _job_manager.create_job(workspace_id, "validate_all", "batch validation")
-    except RuntimeError as exc:
-        return f"Error: {exc}"
-
-    async def _run_job(jid: str) -> None:
-        async def _progress(pct: int, msg: str) -> None:
-            await _job_manager.update_progress(jid, pct, msg, "validate")
-
-        result = await stage_validate.validate_all(workspace_id, progress_cb=_progress)
-        summary = {
-            "total_validated": result.get("total_validated", 0),
-            "confirmed": result.get("confirmed", 0),
-            "false_positives": result.get("false_positives", 0),
-            "manual_review": result.get("manual_review", 0),
-        }
-        await _job_manager.complete_job(jid, summary)
-
-    await _job_manager.start_job(job_id, _run_job(job_id))
-    return _format_job_started({
-        "status": "job_started",
-        "job_id": job_id,
-        "message": "Batch validation started for all unvalidated findings.",
-        "estimated_time": "3-10 minutes",
-    })
+    # operations.validate_all handles the create_job → start_job → run_job
+    # → complete_job sequence when given a job_manager.
+    result = await operations.validate_all(workspace_id, job_manager=_job_manager)
+    if result.get("status") == "error":
+        return f"Error: {result.get('message', 'unknown error')}"
+    return _format_job_started(result)
 
 
 @mcp.tool(
@@ -1486,7 +1223,7 @@ async def bughound_validate_all(workspace_id: str) -> str:
 )
 async def bughound_validate_immediate_wins(workspace_id: str) -> str:
     """Verify immediate wins from Stage 3."""
-    result = await stage_validate.validate_immediate_wins(workspace_id)
+    result = await operations.validate_immediate_wins(workspace_id)
     return _format_immediate_wins_result(result)
 
 
@@ -1506,28 +1243,14 @@ async def bughound_validate_immediate_wins(workspace_id: str) -> str:
 )
 async def bughound_generate_report(workspace_id: str, report_type: str = "all") -> str:
     """Generate security assessment report(s)."""
-    import asyncio as _asyncio
-
-    # Auto-wait for validation if it's still running
-    try:
-        running_jobs = await _job_manager.list_jobs(
-            workspace_id=workspace_id,
-            status_filter=JobStatus.RUNNING,
-        )
-        validate_jobs = [j for j in running_jobs if j.get("job_type") == "validate_all"]
-        if validate_jobs:
-            job_id = validate_jobs[0]["job_id"]
-            logger.info("report.waiting_for_validation", job_id=job_id)
-            # Poll until validation completes (max 10 minutes)
-            for _ in range(120):
-                await _asyncio.sleep(5)
-                status = await _job_manager.get_status(job_id)
-                if status and status["status"] in ("COMPLETED", "FAILED", "TIMED_OUT"):
-                    break
-    except Exception:
-        pass  # Proceed with report generation even if check fails
-
-    result = await stage_report.generate_report(workspace_id, report_type)
+    # operations.generate_report handles the wait-for-validation poll when
+    # given a job_manager and wait_for_validation=True (the default).
+    result = await operations.generate_report(
+        workspace_id,
+        report_type,
+        wait_for_validation=True,
+        job_manager=_job_manager,
+    )
     return _format_report_result(result)
 
 
@@ -1545,7 +1268,7 @@ async def bughound_generate_report(workspace_id: str, report_type: str = "all") 
 )
 async def bughound_job_status(job_id: str) -> str:
     """Poll job status."""
-    status = await _job_manager.get_status(job_id)
+    status = await operations.get_job_status(_job_manager, job_id)
     if status is None:
         return f"Error: Job '{job_id}' not found."
 
@@ -1635,7 +1358,7 @@ async def bughound_job_status(job_id: str) -> str:
 )
 async def bughound_job_results(job_id: str) -> str:
     """Get completed job results."""
-    status = await _job_manager.get_status(job_id)
+    status = await operations.get_job_results(_job_manager, job_id)
     if status is None:
         return f"Error: Job '{job_id}' not found."
 
@@ -1698,7 +1421,7 @@ async def bughound_job_results(job_id: str) -> str:
 async def bughound_job_cancel(job_id: str) -> str:
     """Cancel a background job."""
     try:
-        cancelled = await _job_manager.cancel_job(job_id)
+        cancelled = await operations.cancel_job(_job_manager, job_id)
     except KeyError:
         return f"Error: Job '{job_id}' not found."
 

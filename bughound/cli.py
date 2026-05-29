@@ -241,60 +241,24 @@ def _preflight_tool_check(quiet: bool = False) -> None:
     if quiet:
         return
 
-    # All tools BugHound uses, grouped by importance
-    # (tool_name, purpose, install_command, critical?)
-    _ALL_TOOLS = [
-        # ── Critical (scanning won't work without these) ──
-        ("nuclei",       "Vulnerability scanning",    "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest", True),
-        ("katana",       "Web crawling",              "go install -v github.com/projectdiscovery/katana/cmd/katana@latest", True),
-        ("subfinder",    "Subdomain discovery",       "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest", True),
-        # ── Recon tools ──
-        ("gau",          "Historical URL discovery",  "go install -v github.com/lc/gau/v2/cmd/gau@latest", False),
-        ("waybackurls",  "Wayback Machine URLs",      "go install -v github.com/tomnomnom/waybackurls@latest", False),
-        ("assetfinder",  "Subdomain discovery",       "go install -v github.com/tomnomnom/assetfinder@latest", False),
-        ("findomain",    "Subdomain discovery",       "apt install findomain  OR  github.com/Edu4rdSHL/findomain", False),
-        ("amass",        "Subdomain enumeration",     "go install -v github.com/owasp-amass/amass/v4/...@latest", False),
-        ("gospider",     "Web crawling",              "go install -v github.com/jaeles-project/gospider@latest", False),
-        ("wafw00f",      "WAF detection",             "pip install wafw00f", False),
-        # ── Discovery tools ──
-        ("ffuf",         "Directory fuzzing",         "go install -v github.com/ffuf/ffuf/v2@latest", False),
-        ("arjun",        "Parameter discovery",       "pip install arjun", False),
-        ("gotator",      "Subdomain permutation",     "go install -v github.com/Josue87/gotator@latest", False),
-        ("puredns",      "DNS resolution/bruteforce", "go install -v github.com/d3mondev/puredns/v2@latest", False),
-        # ── Validation tools ──
-        ("sqlmap",       "SQLi validation",           "apt install sqlmap  OR  pip install sqlmap", False),
-        ("dalfox",       "XSS validation",            "go install -v github.com/hahwul/dalfox/v2@latest", False),
-        # ── Secret verification ──
-        ("trufflehog",   "Verified secret detection", "curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin", False),
-        # ── CMS scanning ──
-        ("wpscan",       "WordPress scanning",        "gem install wpscan  OR  apt install wpscan", False),
-        # ── One-liner pipeline tools ──
-        ("qsreplace",   "Query string replacement",   "go install -v github.com/tomnomnom/qsreplace@latest", False),
-        ("kxss",        "XSS reflection detection",    "go install -v github.com/Emoe/kxss@latest", False),
-        ("Gxss",        "XSS reflection + context",    "go install -v github.com/KathanP19/Gxss@latest", False),
-        ("gf",          "URL pattern matching",        "go install -v github.com/tomnomnom/gf@latest", False),
-        ("unfurl",      "URL component extraction",    "go install -v github.com/tomnomnom/unfurl@latest", False),
-        ("anew",        "Unique line appending",       "go install -v github.com/tomnomnom/anew@latest", False),
-        ("uro",         "URL deduplication",           "pip install uro", False),
-        ("urldedupe",   "Smart URL dedup",             "go install -v github.com/ameenmaali/urldedupe@latest", False),
-        ("bhedak",      "Upgraded qsreplace",          "go install -v github.com/R0X4R/bhedak@latest", False),
-        ("interlace",   "Parallel execution",          "pip install interlace", False),
+    # Use the canonical tool registry from operations (single source of truth,
+    # consolidates what used to be duplicated between cli.py and server.py).
+    # Skip httpx — its Go-vs-Python detection is handled by the special check above.
+    from bughound.operations import check_tool_coverage
+
+    coverage = check_tool_coverage()
+    installed = [(t.name, t.purpose) for t in coverage.installed if t.name != "httpx"]
+    missing_critical = [
+        (t.name, t.purpose, t.install_cmd)
+        for t in coverage.missing_critical if t.name != "httpx"
     ]
-
-    installed = []
-    missing_critical = []
-    missing_optional = []
-
-    for tool, purpose, install_cmd, critical in _ALL_TOOLS:
-        if shutil.which(tool):
-            installed.append((tool, purpose))
-        elif critical:
-            missing_critical.append((tool, purpose, install_cmd))
-        else:
-            missing_optional.append((tool, purpose, install_cmd))
+    missing_optional = [
+        (t.name, t.purpose, t.install_cmd) for t in coverage.missing_optional
+    ]
+    total_tools = coverage.total - 1  # exclude httpx from the bulk total
 
     # Show summary
-    print(f"  {_C.GREEN}Tools installed: {len(installed)}/{len(_ALL_TOOLS)}{_C.RESET}")
+    print(f"  {_C.GREEN}Tools installed: {len(installed)}/{total_tools}{_C.RESET}")
 
     if missing_critical:
         print(f"  {_C.RED}Missing (recommended):{_C.RESET}")
@@ -385,7 +349,7 @@ async def _run_init(target: str, depth: str, verbose: bool = False) -> str:
 
 async def _run_enumerate(workspace_id: str, verbose: bool = False) -> None:
     """Stage 1: Enumerate subdomains."""
-    from bughound.stages import enumerate as stage_enumerate
+    from bughound import operations
 
     _print_stage(1, "Enumerate")
 
@@ -393,7 +357,7 @@ async def _run_enumerate(workspace_id: str, verbose: bool = False) -> None:
         print(f"  {_C.DIM}[*] Running subdomain enumeration (subfinder, crtsh)...{_C.RESET}",
               file=sys.stderr)
 
-    result = await stage_enumerate.enumerate_light(workspace_id)
+    result = await operations.enumerate_light(workspace_id)
     if result.get("data", {}).get("skipped"):
         print(f"  {_C.DIM}Skipped (single host){_C.RESET}")
     else:
@@ -496,7 +460,7 @@ async def _run_discover(workspace_id: str, job_manager: Any,
                         verbose: bool = False, max_hosts: int = 0,
                         timeout_mins: int = 60) -> None:
     """Stage 2: Discovery."""
-    from bughound.stages import discover as stage_discover
+    from bughound import operations
 
     _print_stage(2, "Discover")
 
@@ -540,8 +504,8 @@ async def _run_discover(workspace_id: str, job_manager: Any,
     _spinner_task = asyncio.create_task(_spin())
     try:
         result = await asyncio.wait_for(
-            stage_discover.discover(
-                workspace_id, job_manager=None,
+            operations.discover(
+                workspace_id,
                 host_filter_cb=_filter_with_spinner_pause,
             ),
             timeout=timeout_mins * 60,
@@ -588,7 +552,7 @@ async def _run_discover(workspace_id: str, job_manager: Any,
 
 async def _run_analyze(workspace_id: str, verbose: bool = False) -> dict:
     """Stage 3: Analyze attack surface."""
-    from bughound.stages import analyze as stage_analyze
+    from bughound import operations
 
     _print_stage(3, "Analyze")
 
@@ -598,7 +562,7 @@ async def _run_analyze(workspace_id: str, verbose: bool = False) -> dict:
         print(f"  {_C.DIM}[*] Classifying parameters, detecting patterns...{_C.RESET}",
               file=sys.stderr)
 
-    result = await stage_analyze.get_attack_surface(workspace_id)
+    result = await operations.get_attack_surface(workspace_id)
 
     if result.get("status") == "error":
         print(f"  {_C.RED}Error: {result.get('message', '?')}{_C.RESET}")
@@ -649,9 +613,7 @@ async def _run_test(
     speed: str = "normal",
 ) -> list[dict]:
     """Stage 4: Execute tests."""
-    from bughound.stages import analyze as stage_analyze
-    from bughound.stages import test as stage_test
-    from bughound.stages import techniques as stage_techniques
+    from bughound import operations
     from bughound.core import workspace
 
     _print_stage(4, "Test")
@@ -673,7 +635,7 @@ async def _run_test(
 
     # Filter by profile so the scan plan reflects what will actually run.
     # The execute_tests filter is also applied later as a safety net.
-    filtered = stage_techniques.filter_classes_by_profile(suggested, test_profile)
+    filtered = operations.filter_test_classes(suggested, test_profile)
 
     scan_plan = {
         "targets": [{"host": target_host, "priority": 1, "test_classes": filtered}],
@@ -686,7 +648,7 @@ async def _run_test(
         },
     }
 
-    await stage_analyze.submit_scan_plan(workspace_id, scan_plan)
+    await operations.submit_scan_plan(workspace_id, scan_plan)
     profile_note = "" if test_profile == "both" else f", profile={test_profile}"
     print(f"  {_C.DIM}Scan plan: {len(filtered)} test classes{profile_note}{_C.RESET}")
 
@@ -696,7 +658,7 @@ async def _run_test(
         for cls in filtered:
             print(f"  {_C.DIM}[*] Queued: {cls}{_C.RESET}", file=sys.stderr)
 
-    result = await stage_test.execute_tests(workspace_id, job_manager, test_profile=test_profile)
+    result = await operations.execute_tests(workspace_id, job_manager=job_manager, test_profile=test_profile)
 
     if result.get("status") == "job_started":
         job_id = result["job_id"]
@@ -735,7 +697,7 @@ async def _run_test(
 async def _run_validate(workspace_id: str, job_manager: Any,
                         verbose: bool = False) -> None:
     """Stage 5: Validate."""
-    from bughound.stages import validate as stage_validate
+    from bughound import operations
 
     _print_stage(5, "Validate")
 
@@ -743,24 +705,18 @@ async def _run_validate(workspace_id: str, job_manager: Any,
         print(f"  {_C.DIM}[*] Validating findings with surgical probes...{_C.RESET}",
               file=sys.stderr)
 
-    try:
-        job_id = await job_manager.create_job(workspace_id, "validate_all", "validation")
-    except RuntimeError as exc:
-        print(f"  {_C.RED}Error: {exc}{_C.RESET}")
+    started = await operations.validate_all(workspace_id, job_manager=job_manager)
+    if started.get("status") == "error":
+        print(f"  {_C.RED}Error: {started.get('message', 'unknown error')}{_C.RESET}")
         return
-
-    async def _progress(pct: int, msg: str) -> None:
-        await job_manager.update_progress(job_id, pct, msg, "validate")
-
-    async def _run_job(jid: str) -> None:
-        result = await stage_validate.validate_all(workspace_id, progress_cb=_progress)
-        await job_manager.complete_job(jid, {
-            "confirmed": result.get("confirmed", 0),
-            "false_positives": result.get("false_positives", 0),
-            "manual_review": result.get("needs_manual_review", 0),
-        })
-
-    await job_manager.start_job(job_id, _run_job(job_id))
+    if started.get("status") != "job_started":
+        # Operation ran synchronously (no job_manager case) — print summary inline.
+        for k in ("confirmed", "false_positives", "manual_review"):
+            v = started.get(k)
+            if v is not None:
+                print(f"  {k}: {v}")
+        return
+    job_id = started["job_id"]
 
     while True:
         await asyncio.sleep(3)
@@ -789,7 +745,7 @@ async def _run_validate(workspace_id: str, job_manager: Any,
 
 async def _run_report(workspace_id: str, verbose: bool = False) -> None:
     """Stage 6: Generate reports."""
-    from bughound.stages import report as stage_report
+    from bughound import operations
 
     _print_stage(6, "Report")
 
@@ -797,7 +753,11 @@ async def _run_report(workspace_id: str, verbose: bool = False) -> None:
         print(f"  {_C.DIM}[*] Generating HTML, JSON, and Markdown reports...{_C.RESET}",
               file=sys.stderr)
 
-    result = await stage_report.generate_report(workspace_id, "all")
+    # CLI runs each stage in sequence, so by the time we reach Stage 6 the
+    # validate job (if any) is already done — skip the wait check.
+    result = await operations.generate_report(
+        workspace_id, "all", wait_for_validation=False,
+    )
 
     if result.get("status") == "success":
         for rt, path in result.get("reports", {}).items():
@@ -1045,8 +1005,8 @@ async def cmd_scan(args: argparse.Namespace) -> None:
         attack_surface = await _run_analyze(workspace_id, verbose=verbose)
     else:
         # Load existing attack surface for later stages
-        from bughound.stages import analyze as stage_analyze
-        attack_surface = await stage_analyze.get_attack_surface(workspace_id)
+        from bughound import operations
+        attack_surface = await operations.get_attack_surface(workspace_id)
 
     # Stage 4
     if resume_stage <= 4:
@@ -1221,8 +1181,8 @@ async def cmd_test(args: argparse.Namespace) -> None:
     job_manager = JobManager()
 
     # Get attack surface (must have been generated by analyze stage)
-    from bughound.stages import analyze as stage_analyze
-    attack_surface = await stage_analyze.get_attack_surface(args.workspace_id)
+    from bughound import operations
+    attack_surface = await operations.get_attack_surface(args.workspace_id)
 
     if attack_surface.get("status") == "error":
         print(f"  {_C.RED}Error: No attack surface found. Run 'bughound analyze {args.workspace_id}' first.{_C.RESET}")
@@ -1288,14 +1248,14 @@ async def cmd_report(args: argparse.Namespace) -> None:
 
 async def cmd_list(args: argparse.Namespace) -> None:
     """List workspaces."""
-    from bughound.core import workspace
+    from bughound import operations
 
     quiet = args.quiet
 
     if not quiet:
         print(_get_banner())
 
-    workspaces = await workspace.list_workspaces()
+    workspaces = await operations.list_workspaces()
 
     if not workspaces:
         if quiet:
