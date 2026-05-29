@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BugHound web UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">BugHound<span class="dim">·webui</span></div>
+    <div class="status" id="connStatus">connecting…</div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span>Workspaces</span>
+        <button id="refreshBtn" title="Refresh list">⟳</button>
+      </div>
+      <ul id="wsList" class="ws-list">
+        <li class="ws-empty">loading…</li>
+      </ul>
+    </aside>
+
+    <main class="main">
+      <div id="empty" class="empty-state">
+        <p>Select a workspace.</p>
+      </div>
+
+      <section id="detail" class="detail" hidden>
+        <header class="detail-header">
+          <h1 id="dTarget">—</h1>
+          <div class="meta">
+            <span id="dState" class="badge">—</span>
+            <span id="dDepth" class="badge">—</span>
+            <code id="dId" class="mono">—</code>
+          </div>
+        </header>
+
+        <nav class="tabs">
+          <button class="tab active" data-tab="summary">Summary</button>
+          <button class="tab" data-tab="findings">Findings</button>
+          <button class="tab" data-tab="events">Events</button>
+        </nav>
+
+        <div class="tab-content">
+          <div class="tab-pane active" data-pane="summary">
+            <div class="grid-2">
+              <div>
+                <h3>Stages</h3>
+                <ol id="stageList" class="stage-list"></ol>
+              </div>
+              <div>
+                <h3>Data</h3>
+                <table class="cat-table">
+                  <thead><tr><th>Category</th><th class="num">Count</th></tr></thead>
+                  <tbody id="catBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-pane" data-pane="findings" hidden>
+            <table class="findings-table">
+              <thead>
+                <tr>
+                  <th>Severity</th>
+                  <th>Class</th>
+                  <th>Endpoint</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="findingsBody"></tbody>
+            </table>
+            <div id="findingsEmpty" class="empty-state small">No findings yet.</div>
+          </div>
+
+          <div class="tab-pane" data-pane="events" hidden>
+            <div class="events-header">
+              <span id="evtStatus" class="badge">disconnected</span>
+              <button id="evtClear">Clear</button>
+            </div>
+            <ul id="evtList" class="evt-list"></ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

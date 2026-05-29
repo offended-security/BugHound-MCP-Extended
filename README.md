@@ -49,6 +49,9 @@ python -m bughound.server
 
 # Mode 3: AI Agent
 ./bhound agent https://target.com --provider openrouter --api-key sk-or-...
+
+# Mode 4: Web UI (read-only dashboard on localhost)
+./bhound webui                  # http://127.0.0.1:8080
 ```
 
 ## Installation
@@ -473,6 +476,79 @@ Stages collapse based on target type:
 - **Single endpoint** (`https://dev.example.com/api`): Stage 1 skipped, Stage 2 crawls from path only
 - **URL list**: Stage 1 skipped, batch probe and crawl
 
+## Adapter Architecture
+
+BugHound has a **core / adapter** split. All pipeline operations live in
+`bughound/operations/` — a single typed contract. CLI, MCP server, and the
+new web UI are three peer adapters that call into the operations layer.
+None of the adapters reach into `bughound/stages/*` directly.
+
+```
+                   ┌────────────────────────┐
+                   │   bughound/operations  │   ← canonical contract
+                   │   workspace, system,   │     (typed params)
+                   │   stages 1-6, jobs,    │
+                   │   composites           │
+                   └────────────────────────┘
+                       ▲       ▲       ▲
+                       │       │       │
+              ┌────────┴──┐ ┌──┴────┐ ┌┴─────────┐
+              │ cli.py    │ │server │ │ webui/   │
+              │ (terminal)│ │ (MCP) │ │ (browser)│
+              └───────────┘ └───────┘ └──────────┘
+```
+
+Adapter responsibilities (NOT operations):
+- Pretty-printing and colors (CLI)
+- JSON-RPC framing (MCP server)
+- HTTP/SSE/static assets (web UI)
+- Permissive input parsing
+- Interactive prompts
+
+This means you can add a new adapter (Slack bot, GitHub Action, REST-only API)
+by writing one new package that imports `bughound.operations` — no edits to
+existing adapters needed.
+
+## Web UI
+
+```bash
+./bhound webui                                      # http://127.0.0.1:8080
+./bhound webui --port 9000
+./bhound webui --host 0.0.0.0                       # exposes to network — no auth
+python -m bughound.webui                            # equivalent to ./bhound webui
+```
+
+Read-only localhost dashboard for monitoring scans. The UI fetches the same
+operations layer that the CLI and MCP server use, so what you see in the
+browser is the same data adapters see.
+
+- **Sidebar:** lists all workspaces in `WORKSPACE_BASE_DIR`, refreshes every 5s.
+- **Summary tab:** stage progress + per-category counts.
+- **Findings tab:** sortable table of findings with severity, class, endpoint, validation status.
+- **Events tab:** live SSE stream of `JobManager` state changes — open the page in one
+  tab, run `./bhound scan ...` in another, watch progress stream in.
+
+**Security defaults:**
+- Binds `127.0.0.1` only. Use `--host 0.0.0.0` explicitly to expose; a loud warning
+  prints to stderr if you do, and there is **no authentication** — Phase 1 assumes
+  single-user / loopback only.
+- CSP header (`default-src 'self'`), `X-Content-Type-Options: nosniff`, no inline JS.
+- Read-only API surface — the UI cannot trigger, modify, or cancel scans.
+
+**Optional install:**
+
+The web UI ships in the base package today (no extra dependencies — uses `aiohttp`
+which is already a base requirement). The `[webui]` extras stub exists for forward
+compatibility with future multi-user / auth additions:
+
+```bash
+pip install -r requirements.txt        # all you need today
+pip install 'bughound[webui]'          # same; reserved for future webui-only deps
+```
+
+If you run `./bhound webui` without the extras installed and a future version
+requires them, you will see a clean error pointing at the install command.
+
 ## Techniques (45 Total)
 
 **Injection**
@@ -503,40 +579,68 @@ Stages collapse based on target type:
 
 ```
 BugHound/
-├── CLAUDE.md                  # Project instructions
-├── PLAN.md                    # Development plan
-├── DEVLOG.md                  # Development journal
 ├── README.md
+├── bhound                     # CLI wrapper script
+├── requirements.txt
 ├── bughound/
-│   ├── server.py              # MCP server entry point
-│   ├── config/
-│   │   └── settings.py        # Configuration
+│   ├── cli.py                 # CLI adapter (./bhound ...)
+│   ├── server.py              # MCP server adapter (./bhound serve)
+│   ├── agent.py               # AI agent mode entry
+│   ├── agent_tools.py         # 12 tools the agent can call
+│   ├── agent_experts.py       # 6 specialist validators (SQLi/XSS/LFI/SSRF/RCE/Auth)
+│   ├── agent_prompts.py       # System prompts per expert
+│   ├── operations/            # ★ canonical contract — called by every adapter
+│   │   ├── workspace.py           # CRUD + dashboard + category drill-down + scope
+│   │   ├── system.py              # TOOL_REGISTRY, check_tool_coverage, list_techniques
+│   │   ├── enumerate.py           # Stage 1
+│   │   ├── discover.py            # Stage 2
+│   │   ├── analyze.py             # Stage 3 + derived views
+│   │   ├── test.py                # Stage 4 + nuclei_scan + pipelines
+│   │   ├── validate.py            # Stage 5
+│   │   ├── report.py              # Stage 6 (with wait-for-validation)
+│   │   ├── jobs.py                # Job query/cancel
+│   │   └── composites.py          # run_full_pipeline + run_recon_only
+│   ├── webui/                 # ★ web UI adapter (./bhound webui)
+│   │   ├── app.py                 # aiohttp application factory
+│   │   ├── routes.py              # GET handlers (thin wrappers over operations)
+│   │   ├── events.py              # SSE stream of JobManager state changes
+│   │   ├── config.py              # webui-only settings
+│   │   └── static/                # vanilla HTML/CSS/JS — no build step
 │   ├── core/
 │   │   ├── target_classifier.py   # Stage 0: target type detection
 │   │   ├── workspace.py           # Workspace CRUD + lazy dir creation
-│   │   ├── job_manager.py         # Async job lifecycle
-│   │   └── tool_runner.py         # Unified subprocess runner
-│   ├── stages/
+│   │   ├── job_manager.py         # Async job lifecycle + pub/sub for webui
+│   │   ├── tool_runner.py         # Unified subprocess runner
+│   │   └── scope.py               # eTLD+1 scope filtering
+│   ├── stages/                # Implementations — NOT called by adapters directly
 │   │   ├── enumerate.py       # Stage 1
 │   │   ├── discover.py        # Stage 2
 │   │   ├── analyze.py         # Stage 3
 │   │   ├── test.py            # Stage 4
+│   │   ├── techniques.py      # 45-technique registry + executors
 │   │   ├── validate.py        # Stage 5
 │   │   └── report.py          # Stage 6
 │   ├── tools/
-│   │   ├── base.py            # Unified base tool
-│   │   ├── recon/             # subfinder, httpx, crtsh, etc.
-│   │   ├── scanning/          # nuclei, ffuf, dalfox, sqlmap, etc.
-│   │   ├── discovery/         # gospider, jsluice, arjun, etc.
-│   │   ├── testing/           # injection_tester, graphql, jwt testers
-│   │   └── oneliners/         # qsreplace, kxss, gf, uro, unfurl, anew + pipeline engine
+│   │   ├── base_tool.py       # Abstract base for tool wrappers
+│   │   ├── recon/             # subfinder, httpx, crtsh, chaos, github, cloud
+│   │   ├── scanning/          # nuclei, ffuf, dalfox, sqlmap, wpscan, nmap
+│   │   ├── discovery/         # crawl, JS analysis, SPA detection, CORS, auth
+│   │   ├── testing/           # injection_tester, graphql, jwt, mass-assignment, DOM XSS
+│   │   ├── oneliners/         # gf, qsreplace, kxss, gxss, uro, urldedupe + pipeline engine
+│   │   └── utils/             # screenshot, helpers
 │   ├── schemas/
-│   │   └── models.py          # Pydantic models
+│   │   └── models.py          # Pydantic models (workspace, jobs, scope, findings)
+│   ├── providers/             # Multi-LLM abstraction (anthropic/openai/grok/openrouter)
+│   ├── templates/             # Report templates (mustache-style placeholders)
+│   ├── config/
+│   │   └── settings.py        # Configuration
 │   └── utils/
-│       └── helpers.py
-├── tests/
+│       ├── helpers.py
+│       └── html_report.py     # HTML report builder
 ├── scripts/
-│   └── install-tools.sh       # Security tools installer
+│   ├── install-tools.sh       # Security tools installer (Go + pip + apt)
+│   ├── gen_tool_catalog.py
+│   └── run_demo.py
 └── workspaces/                # Runtime data (gitignored)
 ```
 

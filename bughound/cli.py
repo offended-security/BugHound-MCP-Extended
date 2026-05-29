@@ -1397,6 +1397,26 @@ async def cmd_serve(args: argparse.Namespace) -> None:
     await mcp.run_async()
 
 
+async def cmd_webui(args: argparse.Namespace) -> None:
+    """Start the read-only web UI."""
+    # Lazy import so the CLI hot path doesn't pay for webui deps when unused.
+    # If the [webui] extra isn't installed, print a clean message and exit.
+    try:
+        from bughound.webui.app import serve
+    except ImportError as exc:
+        print(
+            f"  {_C.RED}Web UI dependencies are not installed.{_C.RESET}",
+            file=sys.stderr,
+        )
+        print(
+            f"  {_C.DIM}Run: pip install 'bughound[webui]'{_C.RESET}",
+            file=sys.stderr,
+        )
+        print(f"  {_C.DIM}({exc}){_C.RESET}", file=sys.stderr)
+        sys.exit(1)
+    await serve(host=args.host, port=args.port)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1528,6 +1548,20 @@ def main() -> None:
     # serve
     subparsers.add_parser("serve", parents=[_common], help="Start MCP server")
 
+    # webui
+    webui_parser = subparsers.add_parser(
+        "webui", parents=[_common], help="Start read-only web UI on localhost",
+    )
+    webui_parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1). Use 0.0.0.0 to expose on all "
+             "interfaces — has no auth, be careful.",
+    )
+    webui_parser.add_argument(
+        "--port", type=int, default=8080,
+        help="Port (default: 8080).",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -1557,6 +1591,7 @@ def main() -> None:
         "list": cmd_list,
         "agent": cmd_agent,
         "serve": cmd_serve,
+        "webui": cmd_webui,
     }
 
     try:

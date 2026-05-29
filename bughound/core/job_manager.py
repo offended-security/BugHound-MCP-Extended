@@ -57,6 +57,10 @@ class JobManager:
         # Serialize file writes per job
         self._write_lock = asyncio.Lock()
         self._initialized = False
+        # Pub/sub: callbacks fired on every state change (after persist).
+        # Each callback receives the JobRecord snapshot as a dict.
+        # Used by the webui SSE stream; safe to leave empty for CLI/MCP.
+        self._subscribers: list[Any] = []
 
     # ------------------------------------------------------------------
     # Initialization: rebuild index from disk on first use
@@ -388,7 +392,13 @@ class JobManager:
         return WORKSPACE_BASE_DIR / ws_id / "jobs" / f"{job_id}.json"
 
     async def _persist(self, job_id: str) -> None:
-        """Write job record to disk. Creates directories lazily."""
+        """Write job record to disk. Creates directories lazily.
+
+        After the file is written, fires every registered subscriber with a
+        JSON-serializable snapshot of the record. Subscribers must not raise;
+        any exception is logged and swallowed so a misbehaving listener can't
+        break job lifecycle.
+        """
         record = self._jobs.get(job_id)
         if record is None:
             return
@@ -402,3 +412,39 @@ class JobManager:
             data = record.model_dump_json(indent=2)
             async with aiofiles.open(path, "w") as f:
                 await f.write(data)
+
+        # Publish to subscribers (webui SSE, future adapters). Snapshot AFTER
+        # the write so listeners see persisted state.
+        if self._subscribers:
+            snapshot = record.model_dump(mode="json")
+            # Iterate over a copy so subscribers can unsubscribe themselves.
+            for cb in list(self._subscribers):
+                try:
+                    await cb(snapshot)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "job.subscriber_error",
+                        job_id=job_id,
+                        error=str(exc),
+                    )
+
+    # ------------------------------------------------------------------
+    # Pub/sub (additive — used by the webui SSE stream)
+    # ------------------------------------------------------------------
+
+    def subscribe(self, callback: Any) -> None:
+        """Register an async callback fired on every job state change.
+
+        Callback signature: `async def cb(snapshot: dict[str, Any]) -> None`.
+        Snapshot is the JobRecord serialized via `model_dump(mode="json")`.
+        Subscribers MUST be removed via `unsubscribe` when no longer needed
+        or the JobManager will hold a reference forever.
+        """
+        self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: Any) -> None:
+        """Remove a previously-registered subscriber. Safe to call twice."""
+        try:
+            self._subscribers.remove(callback)
+        except ValueError:
+            pass
