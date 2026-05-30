@@ -31,9 +31,12 @@ BugHound is a Model Context Protocol (MCP) server that provides a complete pipel
 
 ## Quick Start
 
+**Requires Python 3.11+.** `mcp >= 1.0.0` needs 3.10+, and the project itself uses 3.11 features.
+
 ```bash
 git clone https://github.com/binderlabs/BugHound-MCP.git
 cd BugHound
+python3.11 -m venv .venv && source .venv/bin/activate  # or any 3.11+
 pip install -r requirements.txt
 ./scripts/install-tools.sh  # Optional: install Go/external tools
 

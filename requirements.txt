@@ -1,4 +1,5 @@
 # BugHound Core Dependencies
+# Requires Python 3.11+ (mcp >= 1.0.0 needs 3.10+, project uses 3.11 features).
 mcp>=1.0.0
 pydantic>=2.0.0
 aiohttp>=3.9.0
@@ -6,6 +7,7 @@ aiofiles>=23.0.0
 structlog>=23.0.0
 dnspython>=2.4.0
 pyyaml>=6.0.0
+tldextract>=5.0.0
 
 # DOM XSS detection (Playwright headless browser)
 playwright>=1.40.0

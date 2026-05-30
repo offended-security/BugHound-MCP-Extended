@@ -6,6 +6,7 @@ bughound-workspaces/
 tests/
 *.log
 .venv/
+venv/
 node_modules/
 .DS_Store
 *.egg-info/
